@@ -1,0 +1,5 @@
+# Los archivos de oferta se cargan en el navegador; no se versionan.
+*.xlsx
+*.xls
+node_modules/
+.DS_Store
