@@ -1,7 +1,7 @@
 // Service worker: permite abrir la app sin conexión una vez visitada.
 // Estrategia "red primero": siempre intenta la versión más reciente y,
 // si no hay conexión, usa la copia guardada.
-const CACHE = 'horario-v1';
+const CACHE = 'horario-v2';
 const ASSETS = [
   './',
   './index.html',
@@ -11,6 +11,7 @@ const ASSETS = [
   './js/parser.js',
   './js/scheduler.js',
   './js/ics.js',
+  './js/projections.js',
   './manifest.webmanifest',
   './icons/icon.svg',
   './icons/icon-192.png',

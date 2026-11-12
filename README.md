@@ -13,6 +13,8 @@ Previsualizador de la oferta académica y planificador automático de horario. F
   - **Cruces**: si no existe ninguna combinación sin cruces, muestra la que menos se cruza (bloques en rojo), indica qué materias siempre se cruzan y en qué horario, si la causa son los grupos que fijaste, y qué materia quitar para resolverlo.
   - Indicador **“Cabe / Se cruza”** en la oferta según lo que ya tienes, y filtro *Solo las que caben*.
   - Respeta grupos sin horario (pasantías, trabajos de grado) y clases que solo se dictan en **fechas específicas** (columna *FECHAS CLASE*).
+- **Proyecciones**: guarda varias versiones de tu horario con nombre (p. ej. “Plan mañanas”, “Con electiva”), con sus grupos exactos. Desde la lista puedes compararlas con una vista previa en miniatura, abrir cualquiera, renombrarla, eliminarla o compartirla por enlace. Si modificas una proyección abierta, la barra indica “cambios sin guardar” y puedes actualizarla con un toque. Cuando cargas una versión nueva del Excel, cada proyección indica si sigue al día o si alguno de sus grupos cambió de horario o desapareció.
+  - Se guardan en el navegador (`localStorage`). El enlace para compartir lleva solo los códigos de materia y números de grupo (no incluye la oferta): quien lo abre lo ve con su propia copia del Excel, y así también puedes pasar una proyección del computador al celular.
 - **Nuevas versiones del Excel**: al cargar una versión actualizada se conserva tu selección y se muestra qué grupos son nuevos, cuáles cambiaron de horario y cuáles desaparecieron, resaltando los que afectan tus materias.
 - **Exportar** el horario a calendario (`.ics`, compatible con Google Calendar, Outlook y el calendario del celular) o imprimirlo.
 - Diseño pensado para **celular** (pestañas inferiores, hoja de detalle deslizable) y escritorio (dos columnas, vista previa del grupo al pasar el cursor). Modo claro/oscuro automático. Se puede instalar como app y abrir sin conexión.
@@ -38,7 +40,7 @@ No necesita dependencias ni compilación. Hay que servirlo por HTTP (los módulo
 ```bash
 npm start          # equivale a: python3 -m http.server 8080
 # abrir http://localhost:8080
-npm test           # pruebas del lector de Excel, el parser, el planificador y el exportador .ics
+npm test           # pruebas del lector de Excel, el parser, el planificador, las proyecciones y el exportador .ics
 ```
 
 Estructura:
@@ -49,6 +51,7 @@ Estructura:
 | `js/parser.js` | Detecta la tabla de oferta y la convierte en materias → componentes → grupos → sesiones. |
 | `js/scheduler.js` | Búsqueda de combinaciones sin cruces, ordenamiento por preferencias y diagnóstico de cruces. |
 | `js/ics.js` | Exportación a calendario. |
+| `js/projections.js` | Proyecciones guardadas: instantánea, verificación contra la oferta y enlace para compartir. |
 | `js/app.js` | Interfaz y persistencia en `localStorage`. |
 
 ## Despliegue en GitHub Pages

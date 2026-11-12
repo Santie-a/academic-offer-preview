@@ -425,6 +425,11 @@ function buildOffer(sheet, header, date1904) {
   };
 }
 
+/** Texto que resume cuándo se dicta un grupo; cambia si cambia su horario o sus fechas. */
+export function groupWhen(g) {
+  return g.sessions.map((x) => `${x.day}@${x.start}-${x.end}`).join(',') + `|${(g.dates || []).join(',')}|${g.startDate || ''}-${g.endDate || ''}`;
+}
+
 /** Huella de cada grupo, para detectar cambios entre versiones del archivo. */
 export function offerSignature(offer) {
   const sig = {};
@@ -435,7 +440,7 @@ export function offerSignature(offer) {
           name: s.displayName + (c.displayLabel ? ` · ${c.displayLabel}` : ''),
           label: g.label,
           subjectKey: s.key,
-          when: g.sessions.map((x) => `${x.day}@${x.start}-${x.end}`).join(',') + `|${g.dates.join(',')}|${g.startDate || ''}-${g.endDate || ''}`,
+          when: groupWhen(g),
         };
       }
     }

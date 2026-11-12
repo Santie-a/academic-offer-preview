@@ -2,6 +2,15 @@ import { readWorkbook } from './xlsx.js';
 import { parseOffer, DAYS, norm, titleCase, offerSignature, diffSignatures } from './parser.js';
 import { plan, hasSolution, overlapsBetween, SORTS } from './scheduler.js';
 import { buildIcs } from './ics.js';
+import {
+  selectionSignature,
+  buildProjection,
+  evaluateProjection,
+  restoreSelection,
+  encodeShare,
+  decodeShare,
+  selectionFromShare,
+} from './projections.js';
 
 // ---------------------------------------------------------------- utilidades
 
@@ -36,6 +45,10 @@ const ICON = {
   upload: '<path d="M12 15V4M7.5 8.5 12 4l4.5 4.5"/><path d="M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/>',
   info: '<circle cx="12" cy="12" r="9"/><path d="M12 11v5.5M12 7.8v.1"/>',
   calendar: '<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/>',
+  bookmark: '<path d="M6.5 3.5h11v17l-5.5-4-5.5 4z"/>',
+  stack: '<path d="m12 3.5 8.5 4.5-8.5 4.5L3.5 8z"/><path d="m3.5 12.5 8.5 4.5 8.5-4.5"/>',
+  edit: '<path d="M4 20h4L19 9l-4-4L4 16z"/><path d="m13.5 6.5 4 4"/>',
+  share: '<circle cx="18" cy="5.5" r="2.5"/><circle cx="6" cy="12" r="2.5"/><circle cx="18" cy="18.5" r="2.5"/><path d="m8.2 10.8 7.6-4.1M8.2 13.2l7.6 4.1"/>',
 };
 const icon = (name, cls = '') => `<svg class="ico ${cls}" viewBox="0 0 24 24" aria-hidden="true">${ICON[name]}</svg>`;
 
@@ -43,7 +56,14 @@ const HUES = [212, 152, 28, 276, 348, 188, 46, 248, 112, 318, 4, 196];
 
 // ---------------------------------------------------------------- persistencia
 
-const KEYS = { offer: 'hp.offer.v1', selection: 'hp.selection.v1', prefs: 'hp.prefs.v1', ui: 'hp.ui.v1' };
+const KEYS = {
+  offer: 'hp.offer.v1',
+  selection: 'hp.selection.v1',
+  prefs: 'hp.prefs.v1',
+  ui: 'hp.ui.v1',
+  projections: 'hp.projections.v1',
+  active: 'hp.activeProjection.v1',
+};
 const store = {
   get(key, fallback) {
     try {
@@ -80,6 +100,9 @@ const state = {
   optionIndex: 0,
   preview: null, // grupo que se previsualiza al pasar el cursor
   notices: [], // avisos persistentes en pantalla
+  projections: [], // horarios guardados
+  activeId: null, // proyección abierta actualmente
+  pendingShare: null, // proyección recibida por enlace, a la espera de abrirla
 };
 
 let subjectsByKey = new Map();
@@ -93,6 +116,9 @@ function loadState() {
   state.prefs = { ...state.prefs, ...store.get(KEYS.prefs, {}) };
   state.ui = { ...state.ui, ...store.get(KEYS.ui, {}), query: '' };
   if (!SORTS[state.prefs.sort]) state.prefs.sort = 'compact';
+  state.projections = store.get(KEYS.projections, []).filter((p) => p && p.id && Array.isArray(p.selection));
+  state.activeId = store.get(KEYS.active, null);
+  if (!state.projections.some((p) => p.id === state.activeId)) state.activeId = null;
   indexOffer();
 }
 
@@ -101,6 +127,12 @@ function saveSelection() {
 }
 function savePrefs() {
   store.set(KEYS.prefs, state.prefs);
+}
+function saveProjections() {
+  const ok = store.set(KEYS.projections, state.projections);
+  store.set(KEYS.active, state.activeId);
+  if (!ok) toast('No se pudo guardar en este navegador (modo privado o sin espacio).', 4000);
+  return ok;
 }
 function saveUi() {
   const { tab, program, semester, onlyFits } = state.ui;
@@ -246,7 +278,9 @@ async function loadFile(file) {
     if (data.warnings.length) {
       state.notices.push({ type: 'warn', text: `${plural(data.warnings.length, 'fila tiene', 'filas tienen')} horas que no se pudieron leer. Revisa los detalles en el menú del archivo.` });
     }
+    state.notices = state.notices.filter((n) => n.type !== 'share');
     render();
+    processPendingShare();
   } catch (err) {
     console.error(err);
     hideToast();
@@ -421,6 +455,7 @@ function renderPlan() {
   const result = currentPlan();
   const option = currentOption();
   renderOptionNav(result);
+  renderProjectionBar(option);
   renderStatus(result, option);
   renderTools();
   renderCalendar(option);
@@ -456,7 +491,10 @@ function renderStatus(result, option) {
     el.innerHTML = `<div class="empty-plan">
       ${icon('calendar', 'big')}
       <p><strong>Tu horario está vacío.</strong><br>Agrega las materias que quieres ver; el planificador elige los grupos para que no se crucen.</p>
-      <button type="button" class="btn btn-primary only-mobile" data-action="tab" data-tab="offer">Ver oferta</button>
+      <div class="empty-actions">
+        <button type="button" class="btn btn-primary only-mobile" data-action="tab" data-tab="offer">Ver oferta</button>
+        ${state.projections.length ? `<button type="button" class="btn" data-action="proj-list">${icon('stack')}Abrir una proyección guardada (${state.projections.length})</button>` : ''}
+      </div>
     </div>`;
     return;
   }
@@ -828,6 +866,306 @@ function openFileInfo() {
   </div>`);
 }
 
+// ---------------------------------------------------------------- proyecciones
+
+const activeProjection = () => state.projections.find((p) => p.id === state.activeId) || null;
+const isDirty = () => {
+  const p = activeProjection();
+  return !!p && selectionSignature(p.selection) !== selectionSignature(state.selection);
+};
+/** Hay un horario que se perdería al abrir otro: no coincide con ninguna proyección guardada. */
+const hasUnsavedWork = () =>
+  state.selection.length > 0 && !state.projections.some((p) => selectionSignature(p.selection) === selectionSignature(state.selection));
+
+const newId = () => `p${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+const fmtWhen = (ts) => new Date(ts).toLocaleDateString('es-CO', { day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' });
+
+function uniqueName(name, exceptId) {
+  const taken = new Set(state.projections.filter((p) => p.id !== exceptId).map((p) => p.name.toLowerCase()));
+  if (!taken.has(name.toLowerCase())) return name;
+  for (let i = 2; ; i++) if (!taken.has(`${name} (${i})`.toLowerCase())) return `${name} (${i})`;
+}
+
+function renderProjectionBar(option) {
+  const el = $('#projBar');
+  if (!state.selection.length && state.activeId) {
+    state.activeId = null;
+    store.set(KEYS.active, null);
+  }
+  const n = state.projections.length;
+  if (!state.selection.length && !n) {
+    el.innerHTML = '';
+    return;
+  }
+  const active = activeProjection();
+  const dirty = isDirty();
+  let label;
+  if (active) label = `<b>${esc(active.name)}</b><em>${dirty ? 'cambios sin guardar' : 'guardada'}</em>`;
+  else if (state.selection.length) label = '<span class="muted">Horario sin guardar</span>';
+  else label = `<span class="muted">${plural(n, 'proyección guardada', 'proyecciones guardadas')}</span>`;
+
+  let save = '';
+  if (state.selection.length && option) {
+    if (!active) save = `<button type="button" class="btn btn-small btn-primary" data-action="proj-save">${icon('bookmark')}Guardar</button>`;
+    else if (dirty) save = `<button type="button" class="btn btn-small btn-primary" data-action="proj-update">${icon('bookmark')}Guardar<span class="hide-xs">&nbsp;cambios</span></button>`;
+  }
+  el.innerHTML = `<div class="proj-current${dirty ? ' is-dirty' : ''}">${icon('bookmark', active && !dirty ? 'is-filled' : '')}<span>${label}</span></div>
+    <div class="proj-actions">${save}
+      <button type="button" class="btn btn-small" data-action="proj-list" aria-label="Ver proyecciones guardadas">${icon('stack')}<span class="hide-xs">Proyecciones</span>${n ? `<small class="count">${n}</small>` : ''}</button>
+    </div>`;
+}
+
+function openSaveDialog({ renameId = null } = {}) {
+  const renaming = renameId ? state.projections.find((p) => p.id === renameId) : null;
+  const option = currentOption();
+  if (!renaming && !option) return;
+  const active = activeProjection();
+  const value = renaming ? renaming.name : uniqueName(active ? active.name : `Proyección ${state.projections.length + 1}`);
+  const m = option?.metrics;
+  const summary = renaming
+    ? ''
+    : `<p class="muted small">Se guardan ${plural(state.selection.length, 'materia', 'materias')} con los grupos de la opción que estás viendo (${fmtHours(m.minutes)}/semana, ${plural(m.days, 'día', 'días')}${option.conflicts.length ? `, ${plural(option.conflicts.length, 'cruce', 'cruces')}` : ', sin cruces'}). Los grupos quedan fijados.</p>`;
+  openSheet(`<form class="sheet-inner" data-form="proj-name" data-rename="${esc(renameId || '')}" novalidate>
+    <header class="sheet-head"><div><h2 id="sheetTitle">${renaming ? 'Renombrar proyección' : 'Guardar proyección'}</h2></div>
+      <button type="button" class="icon-btn" data-action="close-sheet" aria-label="Cerrar">${icon('x')}</button></header>
+    <div class="sheet-body">
+      <label class="field"><span>Nombre</span>
+        <input name="name" type="text" maxlength="60" value="${esc(value)}" autocomplete="off" enterkeyhint="done" required>
+      </label>
+      ${summary}
+    </div>
+    <footer class="sheet-foot">
+      <button type="button" class="btn" data-action="close-sheet">Cancelar</button>
+      <button type="submit" class="btn btn-primary">${renaming ? 'Renombrar' : 'Guardar'}</button>
+    </footer>
+  </form>`);
+  const input = $('#sheet input[name="name"]');
+  input.focus();
+  input.select();
+}
+
+function submitNameForm(form) {
+  const name = form.elements.name.value.trim().slice(0, 60);
+  if (!name) {
+    form.elements.name.focus();
+    return;
+  }
+  const renameId = form.dataset.rename;
+  if (renameId) {
+    const p = state.projections.find((x) => x.id === renameId);
+    if (p) {
+      p.name = uniqueName(name, p.id);
+      saveProjections();
+    }
+    openProjectionList();
+    renderPlan();
+    return;
+  }
+  const option = currentOption();
+  if (!option) return;
+  const proj = buildProjection({ id: newId(), name: uniqueName(name), selection: state.selection, option, offerFile: state.offer?.meta.fileName });
+  state.projections.unshift(proj);
+  state.activeId = proj.id;
+  state.selection = proj.selection.map((e) => ({ ...e, pins: { ...e.pins } }));
+  saveSelection();
+  if (saveProjections()) toast(`“${proj.name}” guardada`);
+  closeSheet();
+  refreshAfterChange();
+}
+
+function updateActiveProjection() {
+  const active = activeProjection();
+  const option = currentOption();
+  if (!active || !option) return;
+  const proj = buildProjection({ id: active.id, name: active.name, selection: state.selection, option, offerFile: state.offer?.meta.fileName });
+  proj.createdAt = active.createdAt;
+  state.projections = state.projections.map((p) => (p.id === active.id ? proj : p));
+  state.selection = proj.selection.map((e) => ({ ...e, pins: { ...e.pins } }));
+  saveSelection();
+  if (saveProjections()) toast(`Cambios guardados en “${proj.name}”`);
+  refreshAfterChange();
+}
+
+function openProjection(id) {
+  const p = state.projections.find((x) => x.id === id);
+  if (!p) return;
+  if (p.id !== state.activeId || isDirty()) {
+    if (hasUnsavedWork() && !confirm('Tu horario actual no está guardado y se reemplazará. ¿Continuar?')) return;
+  }
+  const check = evaluateProjection(p, subjectsByKey);
+  state.selection = restoreSelection(p, subjectsByKey);
+  state.activeId = p.id;
+  saveSelection();
+  saveProjections();
+  closeSheet();
+  state.ui.tab = 'plan';
+  saveUi();
+  refreshAfterChange({ keepSheet: false });
+  window.scrollTo({ top: 0 });
+  if (check.missingGroups.length || check.missingSubjects.length) toast('Algunos grupos ya no están en la oferta; se eligieron automáticamente.', 4500);
+  else if (check.changedGroups.length) toast('Abierta. Ojo: algunos grupos cambiaron de horario desde que la guardaste.', 4500);
+  else toast(`“${p.name}” abierta`);
+}
+
+function deleteProjection(id) {
+  const p = state.projections.find((x) => x.id === id);
+  if (!p || !confirm(`¿Eliminar la proyección “${p.name}”? Tu horario actual no cambia.`)) return;
+  state.projections = state.projections.filter((x) => x.id !== id);
+  if (state.activeId === id) state.activeId = null;
+  saveProjections();
+  renderPlan();
+  if (state.projections.length) openProjectionList();
+  else closeSheet();
+}
+
+function miniPreview(p) {
+  const hue = new Map(p.selection.map((e) => [e.key, HUES[(e.color ?? 0) % HUES.length]]));
+  const blocks = p.blocks || [];
+  const days = blocks.some((b) => b.day === 5) ? 6 : 5;
+  let min = 7 * 60;
+  let max = 19 * 60;
+  if (blocks.length) {
+    min = Math.min(min, Math.floor(Math.min(...blocks.map((b) => b.start)) / 60) * 60);
+    max = Math.max(max, Math.ceil(Math.max(...blocks.map((b) => b.end)) / 60) * 60);
+  }
+  const pct = (m) => ((m - min) / (max - min)) * 100;
+  const cols = Array.from({ length: days }, (_, d) =>
+    `<span>${blocks
+      .filter((b) => b.day === d)
+      .map((b) => `<i style="--h:${hue.get(b.key) ?? 220};top:${pct(b.start)}%;height:${pct(b.end) - pct(b.start)}%"></i>`)
+      .join('')}</span>`,
+  ).join('');
+  return `<span class="mini" style="--cols:${days}" aria-hidden="true">${cols}</span>`;
+}
+
+function projectionStatus(p) {
+  const r = evaluateProjection(p, subjectsByKey);
+  const out = [];
+  if (r.missingSubjects.length) out.push(`<span class="tag tag-bad">${plural(r.missingSubjects.length, 'materia ya no está', 'materias ya no están')}</span>`);
+  if (r.missingGroups.length) out.push(`<span class="tag tag-bad">${plural(r.missingGroups.length, 'grupo ya no existe', 'grupos ya no existen')}</span>`);
+  if (r.changedGroups.length) out.push(`<span class="tag tag-warn" title="${esc(r.changedGroups.join(', '))}">${plural(r.changedGroups.length, 'grupo cambió de horario', 'grupos cambiaron de horario')}</span>`);
+  if (p.stats.conflicts) out.push(`<span class="tag tag-bad">${plural(p.stats.conflicts, 'cruce', 'cruces')}</span>`);
+  if (!out.length) out.push('<span class="tag tag-ok">Al día con la oferta</span>');
+  return out.join('');
+}
+
+function openProjectionList() {
+  const list = state.projections
+    .map((p) => {
+      const active = p.id === state.activeId;
+      const names = p.selection.map((e) => subjectsByKey.get(e.key)?.displayName || e.name).join(', ');
+      return `<li class="proj-card${active ? ' is-active' : ''}">
+        <button type="button" class="proj-open" data-action="proj-open" data-id="${esc(p.id)}" aria-label="Abrir ${esc(p.name)}">
+          ${miniPreview(p)}
+          <span class="proj-text">
+            <span class="proj-name">${esc(p.name)}${active ? `<span class="pill">${isDirty() ? 'Abierta · con cambios' : 'Abierta'}</span>` : ''}</span>
+            <span class="proj-stats">${plural(p.stats.subjects, 'materia', 'materias')} · ${fmtHours(p.stats.minutes)}/sem · ${plural(p.stats.days, 'día', 'días')}</span>
+            <span class="proj-subjects">${esc(names)}</span>
+            <span class="proj-tags">${projectionStatus(p)}</span>
+          </span>
+        </button>
+        <div class="proj-btns">
+          <span class="proj-date">Guardada ${esc(fmtWhen(p.updatedAt))}</span>
+          <button type="button" class="icon-btn" data-action="proj-rename" data-id="${esc(p.id)}" aria-label="Renombrar ${esc(p.name)}" title="Renombrar">${icon('edit')}</button>
+          <button type="button" class="icon-btn" data-action="proj-share" data-id="${esc(p.id)}" aria-label="Compartir ${esc(p.name)}" title="Compartir enlace">${icon('share')}</button>
+          <button type="button" class="icon-btn danger" data-action="proj-delete" data-id="${esc(p.id)}" aria-label="Eliminar ${esc(p.name)}" title="Eliminar">${icon('trash')}</button>
+        </div>
+      </li>`;
+    })
+    .join('');
+  const canSave = state.selection.length > 0 && !!currentOption();
+  openSheet(`<div class="sheet-inner">
+    <header class="sheet-head"><div><h2 id="sheetTitle">Proyecciones</h2></div>
+      <button type="button" class="icon-btn" data-action="close-sheet" aria-label="Cerrar">${icon('x')}</button></header>
+    <div class="sheet-body">
+      <p class="muted small">Guarda varias versiones de tu horario para compararlas y volver a cualquiera. Se guardan solo en este navegador; para pasarlas a otro dispositivo usa “Compartir”.</p>
+      ${list ? `<ul class="proj-list">${list}</ul>` : `<div class="empty-small">Aún no tienes proyecciones guardadas.</div>`}
+    </div>
+    ${canSave ? `<footer class="sheet-foot"><button type="button" class="btn btn-primary" data-action="proj-save">${icon('bookmark')}Guardar horario actual como nueva</button></footer>` : ''}
+  </div>`);
+}
+
+async function shareProjection(id) {
+  const p = state.projections.find((x) => x.id === id);
+  if (!p) return;
+  const url = `${location.origin}${location.pathname}#p=${encodeShare(p, subjectsByKey)}`;
+  if (navigator.share) {
+    try {
+      await navigator.share({ title: `Horario: ${p.name}`, text: `Mi proyección de horario “${p.name}”. Abre el enlace y carga la oferta para verla.`, url });
+      return;
+    } catch (err) {
+      if (err?.name === 'AbortError') return;
+    }
+  }
+  try {
+    await navigator.clipboard.writeText(url);
+    toast('Enlace copiado. Quien lo abra verá esta proyección con su propia copia de la oferta.', 4000);
+  } catch {
+    openSheet(`<div class="sheet-inner">
+      <header class="sheet-head"><div><h2 id="sheetTitle">Compartir “${esc(p.name)}”</h2></div>
+        <button type="button" class="icon-btn" data-action="close-sheet" aria-label="Cerrar">${icon('x')}</button></header>
+      <div class="sheet-body"><label class="field"><span>Copia este enlace</span><input type="text" readonly value="${esc(url)}"></label></div>
+    </div>`);
+    $('#sheet input').select();
+  }
+}
+
+function readShareFromHash() {
+  const m = /[#&]p=([A-Za-z0-9_-]+)/.exec(location.hash);
+  if (!m) return;
+  history.replaceState(null, '', location.pathname + location.search);
+  const shared = decodeShare(m[1]);
+  if (!shared) {
+    state.notices.push({ type: 'error', text: 'El enlace de la proyección compartida no es válido o está incompleto.' });
+    renderNotices();
+    return;
+  }
+  state.pendingShare = shared;
+}
+
+function processPendingShare() {
+  const shared = state.pendingShare;
+  if (!shared) return;
+  if (!state.offer) {
+    state.notices = state.notices.filter((n) => n.type !== 'share');
+    state.notices.push({ type: 'share', text: `Te compartieron la proyección “${shared.name}”. Carga el Excel de la oferta para verla.` });
+    renderNotices();
+    return;
+  }
+  const rows = shared.items
+    .map((it) => {
+      const subject = subjectsByKey.get(it.key);
+      return `<li>${esc(subject?.displayName || it.name || it.key)}${subject ? '' : ' <span class="tag tag-bad">no está en tu oferta</span>'}</li>`;
+    })
+    .join('');
+  openSheet(`<div class="sheet-inner">
+    <header class="sheet-head"><div><h2 id="sheetTitle">Proyección compartida</h2></div>
+      <button type="button" class="icon-btn" data-action="share-dismiss" aria-label="Cerrar">${icon('x')}</button></header>
+    <div class="sheet-body">
+      <p><b>${esc(shared.name)}</b> · ${plural(shared.items.length, 'materia', 'materias')}</p>
+      <ul class="plain-list">${rows}</ul>
+      <p class="muted small">Se guardará en tus proyecciones con los mismos grupos, según la oferta que tienes cargada.</p>
+    </div>
+    <footer class="sheet-foot">
+      <button type="button" class="btn" data-action="share-dismiss">Descartar</button>
+      <button type="button" class="btn btn-primary" data-action="share-accept">${icon('bookmark')}Guardar y abrir</button>
+    </footer>
+  </div>`);
+}
+
+function acceptShare() {
+  const shared = state.pendingShare;
+  if (!shared) return;
+  state.pendingShare = null;
+  const selection = selectionFromShare(shared, subjectsByKey);
+  const items = selection.filter((e) => subjectsByKey.has(e.key)).map((e) => ({ subject: subjectsByKey.get(e.key), pins: e.pins }));
+  const option = plan(items, state.prefs).options[0] || null;
+  const proj = buildProjection({ id: newId(), name: uniqueName(shared.name), selection, option, offerFile: state.offer?.meta.fileName });
+  state.projections.unshift(proj);
+  saveProjections();
+  openProjection(proj.id);
+}
+
 // ---------------------------------------------------------------- acciones
 
 function exportIcs() {
@@ -945,7 +1283,9 @@ function handleAction(btn) {
     case 'clear':
       if (confirm('¿Quitar todas las materias de tu horario?')) {
         state.selection = [];
+        state.activeId = null;
         saveSelection();
+        saveProjections();
         refreshAfterChange();
       }
       break;
@@ -961,8 +1301,9 @@ function handleAction(btn) {
       pickFile();
       break;
     case 'forget':
-      if (confirm('Se borrarán la oferta cargada y tu selección de este navegador. ¿Continuar?')) {
-        Object.values(KEYS).forEach((k) => store.remove(k));
+      if (confirm('Se borrarán la oferta cargada y tu horario actual de este navegador. Tus proyecciones guardadas se conservan. ¿Continuar?')) {
+        [KEYS.offer, KEYS.selection, KEYS.prefs, KEYS.ui, KEYS.active].forEach((k) => store.remove(k));
+        state.activeId = null;
         state.offer = null;
         state.selection = [];
         state.notices = [];
@@ -972,6 +1313,34 @@ function handleAction(btn) {
       }
       break;
     case 'close-sheet':
+      closeSheet();
+      break;
+    case 'proj-save':
+      openSaveDialog();
+      break;
+    case 'proj-update':
+      updateActiveProjection();
+      break;
+    case 'proj-list':
+      openProjectionList();
+      break;
+    case 'proj-open':
+      openProjection(btn.dataset.id);
+      break;
+    case 'proj-rename':
+      openSaveDialog({ renameId: btn.dataset.id });
+      break;
+    case 'proj-delete':
+      deleteProjection(btn.dataset.id);
+      break;
+    case 'proj-share':
+      shareProjection(btn.dataset.id);
+      break;
+    case 'share-accept':
+      acceptShare();
+      break;
+    case 'share-dismiss':
+      state.pendingShare = null;
       closeSheet();
       break;
     default:
@@ -1059,6 +1428,16 @@ function bindEvents() {
   }
 
   const sheet = $('#sheet');
+  sheet.addEventListener('submit', (e) => {
+    const form = e.target.closest('form[data-form="proj-name"]');
+    if (!form) return;
+    e.preventDefault();
+    submitNameForm(form);
+  });
+  window.addEventListener('hashchange', () => {
+    readShareFromHash();
+    processPendingShare();
+  });
   sheet.addEventListener('close', () => {
     document.body.classList.remove('has-sheet');
     state.sheetKey = null;
@@ -1109,6 +1488,8 @@ function bindEvents() {
 loadState();
 bindEvents();
 render();
+readShareFromHash();
+processPendingShare();
 
 if ('serviceWorker' in navigator && location.protocol === 'https:') {
   navigator.serviceWorker.register('sw.js').catch(() => {});
